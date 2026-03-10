@@ -538,9 +538,24 @@ const SUBJECT_SYSTEM_PROMPTS = {
 "General": `You are Sage, a comprehensive AI study companion for healthcare, nursing, and science students in Nigeria. You have expert knowledge across all subjects. Be thorough, detailed, and encouraging. Always provide clear definitions, clinical examples, mnemonics, and practice questions. Tailor your responses to the Nigerian educational context when relevant.`,
 };
 
+
+// ── SEND MESSAGE TO AI ────────────────────────────────────
+app.post("/api/chat/message", authMiddleware, async (req, res) => {
+  try {
+    const { message, subject, history } = req.body;
+    const user = await getWebUser(req.user.userId);
+
+    const allowed = await canSendMessage(user);
+    if (!allowed) {
+      return res.status(429).json({
+        error: "Daily limit reached",
+        message: `You've used all ${PLANS.free.messagesPerDay} free messages today. Upgrade to Premium for unlimited access! ⭐`,
+        limitReached: true,
+      });
+    }
+
     const systemPrompt = SUBJECT_SYSTEM_PROMPTS[subject] || SUBJECT_SYSTEM_PROMPTS["General"];
 
-    // Build conversation history
     const messages = [];
     if (history && history.length > 0) {
       history.slice(-10).forEach(h => {
@@ -549,7 +564,6 @@ const SUBJECT_SYSTEM_PROMPTS = {
     }
     messages.push({ role: "user", content: message });
 
-    // Call Anthropic
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 2000,
@@ -559,7 +573,6 @@ const SUBJECT_SYSTEM_PROMPTS = {
 
     const reply = response.content[0].text;
 
-    // Update message count and points
     await db.collection("users").updateOne(
       { _id: user._id },
       {
@@ -568,7 +581,6 @@ const SUBJECT_SYSTEM_PROMPTS = {
       }
     );
 
-    // Save to chat history
     await db.collection("messages").insertOne({
       userId: req.user.userId,
       subject,
@@ -588,7 +600,7 @@ const SUBJECT_SYSTEM_PROMPTS = {
   }
 });
 
-// GET CHAT HISTORY
+// ── GET CHAT HISTORY ──────────────────────────────────────
 app.get("/api/chat/history/:subject", authMiddleware, async (req, res) => {
   try {
     const history = await db.collection("messages")
@@ -602,10 +614,7 @@ app.get("/api/chat/history/:subject", authMiddleware, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  QUIZ ROUTES
-// ════════════════════════════════════════════════════════════
-
+// ── QUIZ GENERATE ─────────────────────────────────────────
 app.post("/api/quiz/generate", authMiddleware, async (req, res) => {
   try {
     const { subject, difficulty } = req.body;
@@ -614,8 +623,8 @@ app.post("/api/quiz/generate", authMiddleware, async (req, res) => {
       return res.status(429).json({ error: "Upgrade to Premium for unlimited quizzes!" });
     }
 
-    const prompt = `Generate 5 multiple choice questions about ${subject} at ${difficulty || "intermediate"} level for Nigerian nursing students. 
-    Return ONLY valid JSON in this exact format:
+    const prompt = `Generate 5 multiple choice questions about ${subject} at ${difficulty || "intermediate"} level for Nigerian nursing/science students. 
+    Return ONLY valid JSON in this exact format with no extra text:
     {
       "questions": [
         {
@@ -636,43 +645,32 @@ app.post("/api/quiz/generate", authMiddleware, async (req, res) => {
     let text = response.content[0].text;
     text = text.replace(/```json|```/g, "").trim();
     const quiz = JSON.parse(text);
-
     res.json(quiz);
   } catch (err) {
     res.status(500).json({ error: "Could not generate quiz" });
   }
 });
 
-// SUBMIT QUIZ SCORE
+// ── SUBMIT QUIZ SCORE ─────────────────────────────────────
 app.post("/api/quiz/score", authMiddleware, async (req, res) => {
   try {
     const { subject, score, total } = req.body;
     const percentage = Math.round((score / total) * 100);
     const points = score * 20;
-
     await db.collection("users").updateOne(
       { _id: new ObjectId(req.user.userId) },
       {
-        $push: {
-          quizScores: {
-            subject, score, total, percentage,
-            date: new Date().toISOString(),
-          }
-        },
+        $push: { quizScores: { subject, score, total, percentage, date: new Date().toISOString() } },
         $inc: { points },
       }
     );
-
     res.json({ success: true, percentage, pointsEarned: points });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  LEADERBOARD ROUTES
-// ════════════════════════════════════════════════════════════
-
+// ── LEADERBOARD ───────────────────────────────────────────
 app.get("/api/leaderboard", authMiddleware, async (req, res) => {
   try {
     const topUsers = await db.collection("users")
@@ -680,33 +678,23 @@ app.get("/api/leaderboard", authMiddleware, async (req, res) => {
       .sort({ points: -1 })
       .limit(20)
       .toArray();
-
-    // Find current user's rank
     const userPoints = (await getWebUser(req.user.userId))?.points || 0;
     const rank = await db.collection("users").countDocuments({ points: { $gt: userPoints } }) + 1;
-
     res.json({ leaderboard: topUsers, userRank: rank });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  PROGRESS ROUTES
-// ════════════════════════════════════════════════════════════
-
+// ── PROGRESS ──────────────────────────────────────────────
 app.get("/api/progress", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-
-    // Get messages per subject
     const subjectStats = await db.collection("messages").aggregate([
       { $match: { userId } },
       { $group: { _id: "$subject", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ]).toArray();
-
-    // Get quiz stats per subject
     const user = await getWebUser(userId);
     const quizStats = {};
     (user.quizScores || []).forEach(q => {
@@ -715,131 +703,72 @@ app.get("/api/progress", authMiddleware, async (req, res) => {
       quizStats[q.subject].correct += q.score;
       quizStats[q.subject].count++;
     });
-
-    res.json({
-      subjectStats,
-      quizStats,
-      totalMessages: user.totalMessages || 0,
-      points: user.points || 0,
-      streak: user.streak || 0,
-    });
+    res.json({ subjectStats, quizStats, totalMessages: user.totalMessages || 0, points: user.points || 0, streak: user.streak || 0 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  PAYMENT ROUTES (PAYSTACK)
-// ════════════════════════════════════════════════════════════
-
-// Initialize payment
+// ── PAYMENT INITIALIZE ────────────────────────────────────
 app.post("/api/payment/initialize", authMiddleware, async (req, res) => {
   try {
     const { plan } = req.body;
     const user = await getWebUser(req.user.userId);
-    if (!PLANS[plan] || plan === "free")
-      return res.status(400).json({ error: "Invalid plan" });
-
-    const amount = PLANS[plan].price * 100; // Paystack uses kobo
+    if (!PLANS[plan] || plan === "free") return res.status(400).json({ error: "Invalid plan" });
+    const amount = PLANS[plan].price * 100;
     const reference = `sage_web_${req.user.userId}_${Date.now()}`;
-
     const response = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${PAYSTACK_SECRET}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: user.email,
-        amount,
-        reference,
-        metadata: {
-          userId: req.user.userId,
-          plan,
-          firstName: user.firstName,
-        },
+        email: user.email, amount, reference,
+        metadata: { userId: req.user.userId, plan, firstName: user.firstName },
         callback_url: `${process.env.WEB_URL || "http://localhost:3001"}/payment/success`,
       }),
     });
-
     const data = await response.json();
     if (!data.status) return res.status(400).json({ error: data.message });
-
-    // Save pending transaction
     await db.collection("transactions").insertOne({
-      userId: req.user.userId,
-      reference,
-      plan,
-      amount: PLANS[plan].price,
-      status: "pending",
-      date: new Date().toISOString(),
+      userId: req.user.userId, reference, plan, amount: PLANS[plan].price, status: "pending", date: new Date().toISOString(),
     });
-
     res.json({ authorizationUrl: data.data.authorization_url, reference });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Paystack webhook
+// ── PAYSTACK WEBHOOK ──────────────────────────────────────
 app.post("/api/payment/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    const hash = crypto
-      .createHmac("sha512", PAYSTACK_SECRET)
-      .update(req.body)
-      .digest("hex");
-
-    if (hash !== req.headers["x-paystack-signature"])
-      return res.status(400).send("Invalid signature");
-
+    const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(req.body).digest("hex");
+    if (hash !== req.headers["x-paystack-signature"]) return res.status(400).send("Invalid signature");
     const event = JSON.parse(req.body);
     if (event.event === "charge.success") {
       const { reference, metadata } = event.data;
       const { userId, plan } = metadata;
-
       const days = PLANS[plan]?.days || 7;
       const expiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-
-      await db.collection("users").updateOne(
-        { _id: new ObjectId(userId) },
-        { $set: { premium: true, premiumExpiry: expiry, plan } }
-      );
-
-      await db.collection("transactions").updateOne(
-        { reference },
-        { $set: { status: "success" } }
-      );
-
-      console.log(`✅ Payment successful: ${userId} upgraded to ${plan}`);
+      await db.collection("users").updateOne({ _id: new ObjectId(userId) }, { $set: { premium: true, premiumExpiry: expiry, plan } });
+      await db.collection("transactions").updateOne({ reference }, { $set: { status: "success" } });
     }
-
     res.sendStatus(200);
   } catch (err) {
-    console.error("Webhook error:", err);
     res.sendStatus(500);
   }
 });
 
-// Verify payment manually
+// ── VERIFY PAYMENT ────────────────────────────────────────
 app.get("/api/payment/verify/:reference", authMiddleware, async (req, res) => {
   try {
-    const response = await fetch(
-      `https://api.paystack.co/transaction/verify/${req.params.reference}`,
-      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
-    );
+    const response = await fetch(`https://api.paystack.co/transaction/verify/${req.params.reference}`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
+    });
     const data = await response.json();
-
     if (data.data?.status === "success") {
-      const { metadata } = data.data;
-      const { userId, plan } = metadata;
+      const { userId, plan } = data.data.metadata;
       const days = PLANS[plan]?.days || 7;
       const expiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-
-      await db.collection("users").updateOne(
-        { _id: new ObjectId(userId) },
-        { $set: { premium: true, premiumExpiry: expiry, plan } }
-      );
-
+      await db.collection("users").updateOne({ _id: new ObjectId(userId) }, { $set: { premium: true, premiumExpiry: expiry, plan } });
       res.json({ success: true, message: `${plan} plan activated!` });
     } else {
       res.json({ success: false, message: "Payment not confirmed yet" });
@@ -849,51 +778,36 @@ app.get("/api/payment/verify/:reference", authMiddleware, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  FEEDBACK ROUTE
-// ════════════════════════════════════════════════════════════
-
+// ── FEEDBACK ──────────────────────────────────────────────
 app.post("/api/feedback", authMiddleware, async (req, res) => {
   try {
     const { rating, liked, improve, features, bugArea, bug } = req.body;
-    await db.collection("feedback").insertOne({
-      userId: req.user.userId,
-      rating, liked, improve, features, bugArea, bug,
-      date: new Date().toISOString(),
-    });
+    await db.collection("feedback").insertOne({ userId: req.user.userId, rating, liked, improve, features, bugArea, bug, date: new Date().toISOString() });
     res.json({ success: true, message: "Thank you for your feedback!" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// SUPPORT TICKET
+// ── SUPPORT TICKET ────────────────────────────────────────
 app.post("/api/support/ticket", authMiddleware, async (req, res) => {
   try {
     const { category, priority, description } = req.body;
     const user = await getWebUser(req.user.userId);
     const ticketId = `SAGE-${Date.now()}`;
-
     await db.collection("support_tickets").insertOne({
-      ticketId,
-      userId: req.user.userId,
+      ticketId, userId: req.user.userId,
       userName: `${user.firstName} ${user.lastName}`,
-      email: user.email,
-      category, priority, description,
-      status: "open",
-      date: new Date().toISOString(),
+      email: user.email, category, priority, description,
+      status: "open", date: new Date().toISOString(),
     });
-
     res.json({ success: true, ticketId, message: `Ticket ${ticketId} submitted! We'll reply within 2 hours.` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  ADMIN ROUTES
-// ════════════════════════════════════════════════════════════
-
+// ── ADMIN ─────────────────────────────────────────────────
 function adminAuth(req, res, next) {
   const password = req.headers["x-admin-password"];
   if (password !== ADMIN_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
@@ -904,10 +818,7 @@ app.get("/api/admin/stats", adminAuth, async (req, res) => {
   try {
     const totalUsers = await db.collection("users").countDocuments();
     const premiumUsers = await db.collection("users").countDocuments({ premium: true });
-    const today = new Date().toDateString();
-    const activeToday = await db.collection("users").countDocuments({
-      lastActive: { $regex: new Date().toISOString().slice(0, 10) }
-    });
+    const activeToday = await db.collection("users").countDocuments({ lastActive: { $regex: new Date().toISOString().slice(0, 10) } });
     const totalMessages = await db.collection("messages").countDocuments();
     const totalRevenue = await db.collection("transactions").aggregate([
       { $match: { status: "success" } },
@@ -915,16 +826,7 @@ app.get("/api/admin/stats", adminAuth, async (req, res) => {
     ]).toArray();
     const feedbackCount = await db.collection("feedback").countDocuments();
     const openTickets = await db.collection("support_tickets").countDocuments({ status: "open" });
-
-    res.json({
-      totalUsers,
-      premiumUsers,
-      activeToday,
-      totalMessages,
-      revenue: totalRevenue[0]?.total || 0,
-      feedbackCount,
-      openTickets,
-    });
+    res.json({ totalUsers, premiumUsers, activeToday, totalMessages, revenue: totalRevenue[0]?.total || 0, feedbackCount, openTickets });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -932,11 +834,7 @@ app.get("/api/admin/stats", adminAuth, async (req, res) => {
 
 app.get("/api/admin/users", adminAuth, async (req, res) => {
   try {
-    const users = await db.collection("users")
-      .find({}, { projection: { password: 0 } })
-      .sort({ createdAt: -1 })
-      .limit(100)
-      .toArray();
+    const users = await db.collection("users").find({}, { projection: { password: 0 } }).sort({ createdAt: -1 }).limit(100).toArray();
     res.json(users);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -945,56 +843,30 @@ app.get("/api/admin/users", adminAuth, async (req, res) => {
 
 app.get("/api/admin/transactions", adminAuth, async (req, res) => {
   try {
-    const transactions = await db.collection("transactions")
-      .find({})
-      .sort({ date: -1 })
-      .limit(100)
-      .toArray();
+    const transactions = await db.collection("transactions").find({}).sort({ date: -1 }).limit(100).toArray();
     res.json(transactions);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/admin/tickets", adminAuth, async (req, res) => {
-  try {
-    const tickets = await db.collection("support_tickets")
-      .find({})
-      .sort({ date: -1 })
-      .toArray();
-    res.json(tickets);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Grant premium to user manually
 app.post("/api/admin/grant-premium", adminAuth, async (req, res) => {
   try {
     const { email, plan, days } = req.body;
     const expiry = new Date(Date.now() + (days || 7) * 24 * 60 * 60 * 1000).toISOString();
-    await db.collection("users").updateOne(
-      { email },
-      { $set: { premium: true, premiumExpiry: expiry, plan: plan || "weekly" } }
-    );
+    await db.collection("users").updateOne({ email }, { $set: { premium: true, premiumExpiry: expiry, plan: plan || "weekly" } });
     res.json({ success: true, message: `Premium granted to ${email}!` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ════════════════════════════════════════════════════════════
-//  HEALTH CHECK
-// ════════════════════════════════════════════════════════════
-
+// ── HEALTH CHECK ──────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "✅ Sage Web Backend is running!", timestamp: new Date().toISOString() });
 });
 
-// ════════════════════════════════════════════════════════════
-//  START SERVER
-// ════════════════════════════════════════════════════════════
-
+// ── START SERVER ──────────────────────────────────────────
 connectDB().then(() => {
   app.listen(PORT, () => {
     console.log(`✅ Sage Web Backend running on port ${PORT}`);
