@@ -617,37 +617,54 @@ app.get("/api/chat/history/:subject", authMiddleware, async (req, res) => {
 // ── QUIZ GENERATE ─────────────────────────────────────────
 app.post("/api/quiz/generate", authMiddleware, async (req, res) => {
   try {
-    const { subject, difficulty } = req.body;
+    const { subject, difficulty, count = 10, batchIndex = 0 } = req.body;
     const user = await getWebUser(req.user.userId);
     if (!isPremium(user) && user.messageCount >= PLANS.free.messagesPerDay) {
       return res.status(429).json({ error: "Upgrade to Premium for unlimited quizzes!" });
     }
 
-    const prompt = `Generate 5 multiple choice questions about ${subject} at ${difficulty || "intermediate"} level for Nigerian nursing/science students. 
-    Return ONLY valid JSON in this exact format with no extra text:
+    const prompt = `You are an expert NCLEX question writer. Generate ${count} NCLEX-style questions about ${subject} for Nigerian nursing students preparing for their nursing board exams. This is batch ${batchIndex + 1} — make sure questions are DIFFERENT from any previous batch by focusing on different clinical scenarios, drug classes, or nursing concepts.
+
+STRICT NCLEX RULES TO FOLLOW:
+1. Every question MUST be a realistic clinical patient scenario (e.g. "A 45-year-old patient admitted with...")
+2. Focus on clinical REASONING, PRIORITY SETTING, SAFETY, and DELEGATION — not just memorization
+3. Use NCLEX cognitive levels: Apply, Analyze, and Evaluate (NOT just knowledge/recall)
+4. Options must be plausible and clinically realistic — no obviously wrong answers
+5. One option must be clearly BEST based on clinical evidence and nursing priority
+6. Explanations must state WHY the correct answer is best AND why each wrong option is incorrect
+7. Use ABCs (Airway, Breathing, Circulation), Maslow's hierarchy, and nursing process (ADPIE) as frameworks
+8. Include questions on: prioritization, delegation to NAP/LPN, patient safety, therapeutic communication, medication safety, or infection control
+9. Vary question types: some should ask "Which action should the nurse take FIRST?", "Which finding requires IMMEDIATE intervention?", "Which task can be delegated?", "Which response by the nurse is MOST appropriate?"
+
+Return ONLY valid JSON with no extra text, markdown, or backticks:
+{
+  "questions": [
     {
-      "questions": [
-        {
-          "question": "question text",
-          "options": ["A. option1", "B. option2", "C. option3", "D. option4"],
-          "correct": "A",
-          "explanation": "detailed explanation of why A is correct and why others are wrong"
-        }
-      ]
-    }`;
+      "question": "A 58-year-old patient with COPD is receiving oxygen at 2L/min via nasal cannula. The patient's SpO2 is 88% and respiratory rate is 28/min. Which action should the nurse take FIRST?",
+      "options": ["A. Increase oxygen flow to 4L/min", "B. Position the patient in high Fowler's position", "C. Notify the physician immediately", "D. Administer a bronchodilator as prescribed"],
+      "correct": "B",
+      "explanation": "B is correct: Positioning in high Fowler's (90 degrees) maximizes lung expansion and improves oxygenation immediately — this is a non-invasive priority nursing action. A is incorrect: Increasing O2 in COPD patients can suppress their hypoxic drive, worsening respiratory effort. C is incorrect: The nurse should first implement independent nursing interventions before calling the physician. D is incorrect: Administering medication requires a physician order and is not the FIRST action."
+    }
+  ]
+}
+
+Now generate 5 NCLEX-style questions for the subject: ${subject}`;
 
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 2000,
+      max_tokens: 4000,
       messages: [{ role: "user", content: prompt }],
     });
 
     let text = response.content[0].text;
-    text = text.replace(/```json|```/g, "").trim();
+    text = text.replace(/```json[\s\S]*?```|```/g, "").trim();
+    // Fix common JSON issues
+    text = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1);
     const quiz = JSON.parse(text);
     res.json(quiz);
   } catch (err) {
-    res.status(500).json({ error: "Could not generate quiz" });
+    console.error("Quiz error:", err.message);
+    res.status(500).json({ error: "Could not generate quiz, please try again" });
   }
 });
 
@@ -876,3 +893,4 @@ connectDB().then(() => {
   console.error("❌ Failed to start:", err);
   process.exit(1);
 });
+
