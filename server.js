@@ -29,8 +29,11 @@ app.use(express.static("public")); // serve frontend from /public
 
 // ─── MongoDB ──────────────────────────────────────────────
 let db;
+let mongoClient; // shared so webhook can access both databases
+
 async function connectDB() {
   const client = new MongoClient(MONGO_URI);
+  mongoClient = client; // save reference
   await client.connect();
   db = client.db("sage_web"); // separate from bot DB
   console.log("✅ Connected to MongoDB!");
@@ -739,7 +742,7 @@ app.post("/api/payment/initialize", authMiddleware, async (req, res) => {
       headers: { Authorization: `Bearer ${PAYSTACK_SECRET}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         email: user.email, amount, reference,
-        metadata: { userId: req.user.userId, plan, firstName: user.firstName },
+        metadata: { userId: req.user.userId, plan, firstName: user.firstName, platform: 'web' },
         callback_url: `${process.env.WEB_URL || "http://localhost:3001"}/payment/success`,
       }),
     });
@@ -754,22 +757,85 @@ app.post("/api/payment/initialize", authMiddleware, async (req, res) => {
   }
 });
 
-// ── PAYSTACK WEBHOOK ──────────────────────────────────────
+// ── PAYSTACK WEBHOOK (Combined — Web + Telegram) ──────────
 app.post("/api/payment/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
+    // Step 1 — Verify signature is really from Paystack
     const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(req.body).digest("hex");
-    if (hash !== req.headers["x-paystack-signature"]) return res.status(400).send("Invalid signature");
-    const event = JSON.parse(req.body);
-    if (event.event === "charge.success") {
-      const { reference, metadata } = event.data;
-      const { userId, plan } = metadata;
-      const days = PLANS[plan]?.days || 7;
-      const expiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-      await db.collection("users").updateOne({ _id: new ObjectId(userId) }, { $set: { premium: true, premiumExpiry: expiry, plan } });
-      await db.collection("transactions").updateOne({ reference }, { $set: { status: "success" } });
+    if (hash !== req.headers["x-paystack-signature"]) {
+      console.log("❌ Webhook signature mismatch — rejected");
+      return res.status(400).send("Invalid signature");
     }
+
+    const event = JSON.parse(req.body);
+    console.log("📩 Webhook received:", event.event);
+
+    if (event.event === "charge.success") {
+      const { reference, metadata, amount, customer } = event.data;
+      const platform = metadata?.platform || "unknown";
+      const plan = metadata?.plan || "weekly";
+      const days = plan === "monthly" ? 30 : 7;
+      const expiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+
+      console.log(`💰 Payment confirmed — platform: ${platform}, plan: ${plan}, ref: ${reference}`);
+
+      // ── Handle Web App Payment ──
+      if (platform === "web" || platform === "unknown") {
+        const webUserId = metadata?.userId;
+        if (webUserId) {
+          try {
+            await db.collection("users").updateOne(
+              { _id: new ObjectId(webUserId) },
+              { $set: { premium: true, premiumExpiry: expiry, plan } }
+            );
+            await db.collection("transactions").updateOne(
+              { reference },
+              { $set: { status: "success" } }
+            );
+            console.log(`✅ Web user ${webUserId} upgraded to ${plan}`);
+          } catch (webErr) {
+            console.error("❌ Web upgrade error:", webErr.message);
+          }
+        }
+      }
+
+      // ── Handle Telegram Bot Payment ──
+      if (platform === "telegram" || platform === "unknown") {
+        const telegramId = metadata?.telegramId || metadata?.userId;
+        if (telegramId) {
+          try {
+            // Connect to telegram bot DB (same MongoDB, different collection)
+            const telegramDb = mongoClient.db("sage_telegram");
+            await telegramDb.collection("users").updateOne(
+              { telegramId: String(telegramId) },
+              { $set: { premium: true, premiumExpiry: expiry, plan, premiumSource: "paystack" } }
+            );
+            console.log(`✅ Telegram user ${telegramId} upgraded to ${plan}`);
+          } catch (tgErr) {
+            console.error("❌ Telegram upgrade error:", tgErr.message);
+          }
+        }
+      }
+
+      // ── Safety Net — if platform unknown, try email match on web users ──
+      if (platform === "unknown" && customer?.email) {
+        try {
+          const result = await db.collection("users").updateOne(
+            { email: customer.email },
+            { $set: { premium: true, premiumExpiry: expiry, plan } }
+          );
+          if (result.modifiedCount > 0) {
+            console.log(`✅ Safety net: upgraded web user by email ${customer.email}`);
+          }
+        } catch (safeErr) {
+          console.error("❌ Safety net error:", safeErr.message);
+        }
+      }
+    }
+
     res.sendStatus(200);
   } catch (err) {
+    console.error("❌ Webhook error:", err.message);
     res.sendStatus(500);
   }
 });
