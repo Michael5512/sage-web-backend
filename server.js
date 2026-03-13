@@ -806,6 +806,19 @@ app.post("/api/feedback", authMiddleware, async (req, res) => {
   }
 });
 
+app.get("/api/admin/feedback", adminAuth, async (req, res) => {
+  try {
+    const feedbacks = await db.collection("feedback")
+      .find({})
+      .sort({ date: -1 })
+      .limit(100)
+      .toArray();
+    res.json(feedbacks);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── SUPPORT TICKET ────────────────────────────────────────
 app.post("/api/support/ticket", authMiddleware, async (req, res) => {
   try {
@@ -873,6 +886,28 @@ app.post("/api/admin/grant-premium", adminAuth, async (req, res) => {
     const expiry = new Date(Date.now() + (days || 7) * 24 * 60 * 60 * 1000).toISOString();
     await db.collection("users").updateOne({ email }, { $set: { premium: true, premiumExpiry: expiry, plan: plan || "weekly" } });
     res.json({ success: true, message: `Premium granted to ${email}!` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/admin/tickets", adminAuth, async (req, res) => {
+  try {
+    const tickets = await db.collection("support_tickets").find({}).sort({ date: -1 }).limit(100).toArray();
+    res.json(tickets);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/resolve-ticket", adminAuth, async (req, res) => {
+  try {
+    const { ticketId } = req.body;
+    await db.collection("support_tickets").updateOne(
+      { ticketId },
+      { $set: { status: "resolved", resolvedAt: new Date().toISOString() } }
+    );
+    res.json({ success: true, message: "Ticket resolved!" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
