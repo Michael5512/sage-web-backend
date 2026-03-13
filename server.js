@@ -913,6 +913,38 @@ app.post("/api/admin/resolve-ticket", adminAuth, async (req, res) => {
   }
 });
 
+app.post("/api/admin/reply-ticket", adminAuth, async (req, res) => {
+  try {
+    const { ticketId, reply } = req.body;
+    if (!ticketId || !reply) return res.status(400).json({ error: "ticketId and reply are required" });
+    await db.collection("support_tickets").updateOne(
+      { ticketId },
+      { $set: { 
+          adminReply: reply, 
+          repliedAt: new Date().toISOString(),
+          status: "replied"
+        } 
+      }
+    );
+    res.json({ success: true, message: "Reply sent!" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/support/my-tickets", authMiddleware, async (req, res) => {
+  try {
+    const tickets = await db.collection("support_tickets")
+      .find({ userId: req.user.userId })
+      .sort({ date: -1 })
+      .limit(20)
+      .toArray();
+    res.json(tickets);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── HEALTH CHECK ──────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "✅ Sage Web Backend is running!", timestamp: new Date().toISOString() });
