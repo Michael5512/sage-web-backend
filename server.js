@@ -761,13 +761,15 @@ app.post("/api/payment/initialize", authMiddleware, async (req, res) => {
 app.post("/api/payment/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     // Step 1 — Verify signature is really from Paystack
-    const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(req.body).digest("hex");
+    // Handle body whether it arrives as Buffer or already-parsed Object
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+    const hash = crypto.createHmac("sha512", PAYSTACK_SECRET).update(rawBody).digest("hex");
     if (hash !== req.headers["x-paystack-signature"]) {
       console.log("❌ Webhook signature mismatch — rejected");
       return res.status(400).send("Invalid signature");
     }
 
-    const event = JSON.parse(req.body);
+    const event = Buffer.isBuffer(req.body) ? JSON.parse(req.body) : req.body;
     console.log("📩 Webhook received:", event.event);
 
     if (event.event === "charge.success") {
@@ -1026,4 +1028,3 @@ connectDB().then(() => {
   console.error("❌ Failed to start:", err);
   process.exit(1);
 });
-
